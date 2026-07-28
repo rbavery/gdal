@@ -17,6 +17,7 @@ import os
 import os.path
 import stat
 import sys
+import threading
 import urllib
 
 import gdaltest
@@ -7049,6 +7050,330 @@ def test_vsis3_extra_1():
 
 ###############################################################################
 # Test credential_process authentication
+
+
+def _create_credential_process(
+    tmp_path,
+    name,
+    access_key_id,
+    *,
+    expirations=("3000-01-01T12:00:00Z",),
+    rotating_access_key=False,
+    delay=0,
+):
+    counter_path = tmp_path / f"{name}_count"
+    script_path = tmp_path / f"{name}.py"
+    script_path.write_text(
+        f"""import json
+import time
+
+counter_path = {str(counter_path)!r}
+try:
+    with open(counter_path, encoding="utf-8") as counter:
+        invocation = len(counter.readlines()) + 1
+except FileNotFoundError:
+    invocation = 1
+with open(counter_path, "a", encoding="utf-8") as counter:
+    counter.write("executed\\n")
+time.sleep({delay!r})
+expirations = {expirations!r}
+credentials = {{
+    "Version": "1",
+    "AccessKeyId": {access_key_id!r} + (f"_{{invocation}}" if {rotating_access_key!r} else ""),
+    "SecretAccessKey": "AWS_SECRET_ACCESS_KEY",
+    "SessionToken": {f"{access_key_id}_TOKEN"!r},
+}}
+expiration = expirations[min(invocation - 1, len(expirations) - 1)]
+if expiration is not None:
+    credentials["Expiration"] = expiration
+print(json.dumps(credentials))
+""",
+        encoding="utf-8",
+    )
+    return script_path, counter_path
+
+
+def _credential_process_execution_count(counter_path):
+    return len(counter_path.read_text(encoding="utf-8").splitlines())
+
+
+def _credential_process_response(request, expected_access_key, payload):
+    assert f"Credential={expected_access_key}/" in request.headers["Authorization"]
+    assert request.headers["X-Amz-Security-Token"] == f"{expected_access_key}_TOKEN"
+    request.send_response(206)
+    request.send_header("Content-Range", f"bytes 0-{len(payload) - 1}/{len(payload)}")
+    request.send_header("Content-Length", len(payload))
+    request.end_headers()
+    request.wfile.write(payload)
+
+
+def test_vsis3_credential_process_cached_across_requests(
+    tmp_path, tmp_vsimem, aws_test_config, webserver_port
+):
+    script_path, counter_path = _create_credential_process(
+        tmp_path, "credential_process", "AWS_ACCESS_KEY_ID"
+    )
+
+    options = {
+        "AWS_SECRET_ACCESS_KEY": "",
+        "AWS_ACCESS_KEY_ID": "",
+        "AWS_SESSION_TOKEN": "",
+        "AWS_CONFIG_FILE": f"{tmp_vsimem}/aws_config",
+        "CPL_AWS_AUTODETECT_EC2": "NO",
+    }
+    gdal.VSICurlClearCache()
+    gdal.FileFromMemBuffer(
+        tmp_vsimem / "aws_config",
+        f"""
+[default]
+credential_process = "{sys.executable}" "{script_path}"
+region = us-east-1
+""",
+    )
+
+    request_count = 3
+    resource_size = 100000
+
+    def range_method(request):
+        assert request.headers["X-Amz-Security-Token"] == "AWS_ACCESS_KEY_ID_TOKEN"
+        byte_range = request.headers["Range"]
+        start, end = (int(value) for value in byte_range[6:].split("-"))
+        end = min(end, resource_size - 1)
+        payload = bytes(offset % 251 for offset in range(start, end + 1))
+        request.send_response(206)
+        request.send_header("Content-Range", f"bytes {start}-{end}/{resource_size}")
+        request.send_header("Content-Length", len(payload))
+        request.end_headers()
+        request.wfile.write(payload)
+
+    handler = webserver.SequentialHandler()
+    for _ in range(request_count):
+        handler.add(
+            "GET",
+            "/credential_process_cache/resource",
+            custom_method=range_method,
+        )
+
+    with webserver.install_http_handler(handler):
+        with gdaltest.config_options(options, thread_local=False):
+            f = open_for_read("/vsis3/credential_process_cache/resource")
+            assert f is not None
+            for offset in (0, 40000, 80000):
+                assert gdal.VSIFSeekL(f, offset, 0) == 0
+                assert gdal.VSIFReadL(1, 1, f) == bytes([offset % 251])
+            gdal.VSIFCloseL(f)
+
+    execution_count = _credential_process_execution_count(counter_path)
+    assert execution_count == 1, (
+        f"{request_count} HTTP range requests caused {execution_count} "
+        "credential_process executions; expected one cached credential result"
+    )
+
+
+def test_vsis3_credential_process_path_specific_profiles(
+    tmp_path, tmp_vsimem, aws_test_config, webserver_port
+):
+    script_a, counter_a = _create_credential_process(
+        tmp_path, "profile_a", "PROFILE_A", expirations=(None,)
+    )
+    script_b, counter_b = _create_credential_process(tmp_path, "profile_b", "PROFILE_B")
+    gdal.VSICurlClearCache()
+    gdal.FileFromMemBuffer(
+        tmp_vsimem / "aws_config",
+        f"""
+[profile profile-a]
+credential_process = "{sys.executable}" "{script_a}"
+region = us-east-1
+[profile profile-b]
+credential_process = "{sys.executable}" "{script_b}"
+region = us-east-1
+""",
+    )
+    options = {
+        "AWS_SECRET_ACCESS_KEY": "",
+        "AWS_ACCESS_KEY_ID": "",
+        "AWS_SESSION_TOKEN": "",
+        "AWS_CONFIG_FILE": f"{tmp_vsimem}/aws_config",
+        "CPL_AWS_AUTODETECT_EC2": "NO",
+    }
+    handler = webserver.SequentialHandler()
+    handler.add(
+        "GET",
+        "/profile-a/resource",
+        custom_method=lambda request: _credential_process_response(
+            request, "PROFILE_A", b"aaa"
+        ),
+    )
+    handler.add(
+        "GET",
+        "/profile-b/resource",
+        custom_method=lambda request: _credential_process_response(
+            request, "PROFILE_B", b"bbb"
+        ),
+    )
+
+    with (
+        gdaltest.config_options(options, thread_local=False),
+        gdaltest.credentials("/vsis3/profile-a", {"AWS_PROFILE": "profile-a"}),
+        gdaltest.credentials("/vsis3/profile-b", {"AWS_PROFILE": "profile-b"}),
+        webserver.install_http_handler(handler),
+    ):
+        with gdal.VSIFile("/vsis3/profile-a/resource", "rb") as f:
+            assert f.read() == b"aaa"
+        with gdal.VSIFile("/vsis3/profile-b/resource", "rb") as f:
+            assert f.read() == b"bbb"
+
+    assert _credential_process_execution_count(counter_a) == 1
+    assert _credential_process_execution_count(counter_b) == 1
+
+
+def test_vsis3_credential_process_expiry_is_handle_specific(
+    tmp_path, tmp_vsimem, aws_test_config, webserver_port
+):
+    script_a, counter_a = _create_credential_process(
+        tmp_path,
+        "expiring_profile_a",
+        "PROFILE_A",
+        expirations=("2000-01-01T00:00:00Z", "3000-01-01T12:00:00Z"),
+        rotating_access_key=True,
+    )
+    script_b, counter_b = _create_credential_process(
+        tmp_path,
+        "valid_profile_b",
+        "PROFILE_B",
+        rotating_access_key=True,
+    )
+    gdal.VSICurlClearCache()
+    gdal.FileFromMemBuffer(
+        tmp_vsimem / "aws_config",
+        f"""
+[profile profile-a]
+credential_process = "{sys.executable}" "{script_a}"
+region = us-east-1
+[profile profile-b]
+credential_process = "{sys.executable}" "{script_b}"
+region = us-east-1
+""",
+    )
+    options = {
+        "AWS_SECRET_ACCESS_KEY": "",
+        "AWS_ACCESS_KEY_ID": "",
+        "AWS_SESSION_TOKEN": "",
+        "AWS_CONFIG_FILE": f"{tmp_vsimem}/aws_config",
+        "CPL_AWS_AUTODETECT_EC2": "NO",
+    }
+
+    def range_response(request, expected_access_key):
+        assert f"Credential={expected_access_key}/" in request.headers["Authorization"]
+        byte_range = request.headers["Range"]
+        start, end = (int(value) for value in byte_range[6:].split("-"))
+        end = min(end, 99999)
+        payload = bytes(offset % 251 for offset in range(start, end + 1))
+        request.send_response(206)
+        request.send_header("Content-Range", f"bytes {start}-{end}/100000")
+        request.send_header("Content-Length", len(payload))
+        request.end_headers()
+        request.wfile.write(payload)
+
+    handler = webserver.SequentialHandler()
+    for _ in range(2):
+        handler.add(
+            "GET",
+            "/profile-a/resource",
+            custom_method=lambda request: range_response(request, "PROFILE_A_2"),
+        )
+    handler.add(
+        "GET",
+        "/profile-b/resource",
+        custom_method=lambda request: range_response(request, "PROFILE_B_1"),
+    )
+
+    with (
+        gdaltest.config_options(options, thread_local=False),
+        gdaltest.credentials("/vsis3/profile-a", {"AWS_PROFILE": "profile-a"}),
+        gdaltest.credentials("/vsis3/profile-b", {"AWS_PROFILE": "profile-b"}),
+        webserver.install_http_handler(handler),
+    ):
+        f_a = open_for_read("/vsis3/profile-a/resource")
+        f_b = open_for_read("/vsis3/profile-b/resource")
+        assert f_a is not None
+        assert f_b is not None
+        for offset in (0, 40000):
+            assert gdal.VSIFSeekL(f_a, offset, 0) == 0
+            assert gdal.VSIFReadL(1, 1, f_a) == bytes([offset % 251])
+        assert gdal.VSIFReadL(1, 1, f_b) == b"\x00"
+        gdal.VSIFCloseL(f_a)
+        gdal.VSIFCloseL(f_b)
+
+    assert _credential_process_execution_count(counter_a) == 2
+    assert _credential_process_execution_count(counter_b) == 1
+
+
+def test_vsis3_credential_process_concurrent_cache_fill(
+    tmp_path, tmp_vsimem, aws_test_config, webserver_port
+):
+    script_path, counter_path = _create_credential_process(
+        tmp_path, "concurrent", "CONCURRENT", delay=0.2
+    )
+    gdal.VSICurlClearCache()
+    gdal.FileFromMemBuffer(
+        tmp_vsimem / "aws_config",
+        f"""
+[default]
+credential_process = "{sys.executable}" "{script_path}"
+region = us-east-1
+""",
+    )
+    options = {
+        "AWS_SECRET_ACCESS_KEY": "",
+        "AWS_ACCESS_KEY_ID": "",
+        "AWS_SESSION_TOKEN": "",
+        "AWS_CONFIG_FILE": f"{tmp_vsimem}/aws_config",
+        "CPL_AWS_AUTODETECT_EC2": "NO",
+    }
+    thread_count = 8
+    handler = webserver.NonSequentialMockedHttpHandler()
+    for i in range(thread_count):
+        handler.add(
+            "GET",
+            f"/concurrent/resource-{i}",
+            206,
+            {
+                "Content-Range": "bytes 0-0/1",
+                "Content-Length": "1",
+            },
+            b"x",
+            expected_headers={"X-Amz-Security-Token": "CONCURRENT_TOKEN"},
+        )
+
+    barrier = threading.Barrier(thread_count)
+    results = [None] * thread_count
+    errors = []
+
+    def worker(index):
+        try:
+            barrier.wait()
+            with gdal.VSIFile(f"/vsis3/concurrent/resource-{index}", "rb") as f:
+                results[index] = f.read()
+        except BaseException as exc:
+            errors.append(exc)
+
+    with (
+        gdaltest.config_options(options, thread_local=False),
+        webserver.install_http_handler(handler),
+    ):
+        threads = [
+            threading.Thread(target=worker, args=(index,))
+            for index in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert not errors
+    assert results == [b"x"] * thread_count
+    assert _credential_process_execution_count(counter_path) == 1
 
 
 def test_vsis3_credential_process(

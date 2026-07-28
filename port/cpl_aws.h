@@ -133,6 +133,9 @@ class VSIS3HandleHelper final : public IVSIS3LikeHandleHelper
     std::string m_osRequestPayer{};
     std::string m_osBucket{};
     std::string m_osObjectKey{};
+    std::string m_osCredentialProcessCacheKey{};
+    std::string m_osCredentialProcessCommand{};
+    mutable GIntBig m_nCredentialProcessExpiration = 0;
     bool m_bUseHTTPS = false;
     bool m_bUseVirtualHosting = false;
     bool m_bIsDirectoryBucket = false;
@@ -151,8 +154,10 @@ class VSIS3HandleHelper final : public IVSIS3LikeHandleHelper
         std::string &osRegion);
 
     static bool GetOrRefreshTemporaryCredentialsFromProcess(
+        const std::string &osCacheKey, const std::string &osCredentialProcess,
         bool bForceRefresh, std::string &osSecretAccessKey,
-        std::string &osAccessKeyId, std::string &osSessionToken);
+        std::string &osAccessKeyId, std::string &osSessionToken,
+        GIntBig &nExpiration);
 
     static bool GetConfigurationFromAssumeRoleWithWebIdentity(
         bool bForceRefresh, const std::string &osPathForOption,
@@ -176,7 +181,8 @@ class VSIS3HandleHelper final : public IVSIS3LikeHandleHelper
         std::string &osMFASerial, std::string &osRoleSessionName,
         std::string &osWebIdentityTokenFile, std::string &osSSOStartURL,
         std::string &osSSOAccountID, std::string &osSSORoleName,
-        std::string &osSSOSession, std::string &osCredentialProcess);
+        std::string &osSSOSession, std::string &osCredentialProcess,
+        std::string &osCredentialProcessCacheKey);
 
     static bool GetConfiguration(const std::string &osPathForOption,
                                  CSLConstList papszOptions,
@@ -184,7 +190,10 @@ class VSIS3HandleHelper final : public IVSIS3LikeHandleHelper
                                  std::string &osAccessKeyId,
                                  std::string &osSessionToken,
                                  std::string &osRegion,
-                                 AWSCredentialsSource &eCredentialsSource);
+                                 AWSCredentialsSource &eCredentialsSource,
+                                 std::string &osCredentialProcessCacheKey,
+                                 std::string &osCredentialProcess,
+                                 GIntBig &nCredentialProcessExpiration);
 
     void RefreshCredentials(const std::string &osPathForOption,
                             bool bForceRefresh) const;
@@ -197,8 +206,11 @@ class VSIS3HandleHelper final : public IVSIS3LikeHandleHelper
         const std::string &osS3SessionToken, const std::string &osEndpoint,
         const std::string &osRegion, const std::string &osRequestPayer,
         const std::string &osBucket, const std::string &osObjectKey,
-        bool bUseHTTPS, bool bUseVirtualHosting,
-        AWSCredentialsSource eCredentialsSource, bool bIsDirectoryBucket);
+        const std::string &osCredentialProcessCacheKey,
+        const std::string &osCredentialProcess,
+        GIntBig nCredentialProcessExpiration, bool bUseHTTPS,
+        bool bUseVirtualHosting, AWSCredentialsSource eCredentialsSource,
+        bool bIsDirectoryBucket);
     ~VSIS3HandleHelper() override;
 
     static VSIS3HandleHelper *BuildFromURI(const char *pszURI,
